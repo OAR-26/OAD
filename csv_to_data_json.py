@@ -1,24 +1,22 @@
 #!/usr/bin/env python3
 """
-Convert a Batsim/OAR-style workload CSV to data.json for goard.
+Convert simulator workload CSV to data.json for goard.
 
 Usage:
     python csv_to_data_json.py input.csv output.json [options]
 
-Handles both comma and tab delimiters (auto-detected).
-Supports Batsim column names (allocated_resources, final_state)
-and OAR-style names (allocated_processors, success as int).
+Format configs live in formats/*.yaml next to this script.
+Each YAML defines column mappings, resource format, and state map
+for one simulator. New simulators: add a YAML file, no code changes.
 
 Options:
-    --base-time INT       Unix timestamp for simulation time 0
+    --format STR          Format name (e.g. batsim) or path to YAML config.
+                          Auto-detected from CSV headers if omitted.
+    --formats-dir DIR     Directory with format YAML files.
+                          Default: formats/ next to this script.
+    --base-time INT       Unix timestamp for simulation time 0.
                           Default: now - ceil(max_finish_time * time_scale)
-
     --time-scale FLOAT    Multiply all simulation times by this factor.
-                          Useful for visualization/demo purposes.
-                          Example:
-                              --time-scale 60
-                          makes 1 simulated second appear as 60 seconds.
-
     --cores-per-node INT  Processors per node (default: 1)
     --cluster STR         Cluster name (default: cluster1)
     --site STR            Site name (default: site1)
@@ -32,90 +30,154 @@ import json
 import math
 import sys
 import time
+from pathlib import Path
+
+try:
+    import yaml
+except ImportError:
+    print("ERROR: pyyaml required. Install: pip install pyyaml", file=sys.stderr)
+    sys.exit(1)
+
+SCRIPT_DIR = Path(__file__).parent
 
 
-# ── Column name aliases ───────────────────────────────────────────────────────
-# Maps canonical name → list of CSV column names to try (first match wins)
-COL = {
-    'job_id':        ['job_id', 'jobID', 'job_id '],
-    'workload':      ['workload_name'],
-    'submission':    ['submission_time'],
-    'walltime':      ['requested_time'],
-    'success':       ['success'],
-    'final_state':   ['final_state'],
-    'start':         ['starting_time'],
-    'finish':        ['finish_time'],
-    'resources':     ['allocated_resources', 'allocated_processors'],
-}
+# ── Config loading ────────────────────────────────────────────────────────────
 
-FINAL_STATE_MAP = {
-    'COMPLETED_SUCCESSFULLY': ('Terminated', 0),
-    'COMPLETED_FAILED':       ('Error',      1),
-    'FAILED':                 ('Error',      1),
-    'KILLED':                 ('Error',      1),
-}
+def load_config(path):
+    with open(path) as f:
+        return yaml.safe_load(f)
 
 
-def col(row, key):
-    for name in COL[key]:
+def detect_format(headers, formats_dir):
+    """Score every YAML in formats_dir against CSV headers, return best."""
+    header_set = {h.strip() for h in headers}
+    best_score, best_cfg, best_name = -1, None, None
+
+    for yaml_path in Path(formats_dir).glob("*.yaml"):
+        try:
+            cfg = load_config(yaml_path)
+        except Exception as e:
+            print(f"Warning: could not load {yaml_path}: {e}", file=sys.stderr)
+            continue
+
+        sig = cfg.get("signature_columns", [])
+        score = sum(1 for col in sig if col in header_set)
+
+        if score > best_score:
+            best_score, best_cfg, best_name = score, cfg, yaml_path.stem
+
+    return best_cfg, best_name, best_score
+
+
+def resolve_config(args):
+    """Return (config_dict, format_name) from --format flag or auto-detect."""
+    formats_dir = args.formats_dir or (SCRIPT_DIR / "formats")
+
+    if args.format:
+        p = Path(args.format)
+        if not p.suffix:
+            p = Path(formats_dir) / f"{args.format}.yaml"
+        cfg = load_config(p)
+        return cfg, cfg.get("name", p.stem)
+
+    # Auto-detect: peek at CSV headers
+    with open(args.input, newline='') as f:
+        sample = f.read(4096)
+
+    dialect = csv.Sniffer().sniff(sample, delimiters=',\t;')
+    first_line = sample.splitlines()[0]
+    headers = first_line.split(dialect.delimiter)
+
+    cfg, name, score = detect_format(headers, formats_dir)
+
+    if cfg is None:
+        print(
+            "ERROR: no matching format found in formats/. "
+            "Pass --format explicitly.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    print(f"Auto-detected format: {name!r} (score={score})", file=sys.stderr)
+    return cfg, name
+
+
+# ── Column access ─────────────────────────────────────────────────────────────
+
+def get_col(row, canonical, cfg):
+    """Get value from row by canonical name using config column mapping."""
+    candidates = cfg.get("columns", {}).get(canonical, [])
+    if isinstance(candidates, str):
+        candidates = [candidates]
+    for name in candidates:
         if name in row:
             return row[name]
     return ''
 
 
-def parse_processor_list(s):
-    s = (s or '').strip()
+# ── Resource parsing ──────────────────────────────────────────────────────────
 
+def _parse_range_or_list(s):
+    """'0 4-7 9' or '0,4-7,9' -> [0, 4, 5, 6, 7, 9]"""
+    s = (s or '').strip()
     if not s:
         return []
-
     result = []
-
     for token in s.replace(',', ' ').split():
         if '-' in token:
             a, b = token.split('-', 1)
             result.extend(range(int(a), int(b) + 1))
         else:
             result.append(int(token))
-
     return result
 
 
-def infer_state(row):
-    """Return (goard_state, exit_code)."""
+_RESOURCE_PARSERS = {
+    'range_or_list': _parse_range_or_list,
+}
 
-    fs = col(row, 'final_state').strip().upper()
 
-    if fs in FINAL_STATE_MAP:
-        return FINAL_STATE_MAP[fs]
+def parse_resources(s, cfg):
+    fmt = cfg.get("resource_format", "range_or_list")
+    parser = _RESOURCE_PARSERS.get(fmt)
+    if parser is None:
+        print(f"ERROR: unknown resource_format {fmt!r}", file=sys.stderr)
+        sys.exit(1)
+    return parser(s)
 
-    # Fall back to numeric success field
-    start = float(col(row, 'start') or 0)
-    finish = float(col(row, 'finish') or 0)
+
+# ── State inference ───────────────────────────────────────────────────────────
+
+def infer_state(row, cfg):
+    """Return (goard_state, exit_code) using config state_map + fallback."""
+    state_map = cfg.get("state_map", {})
+    fs = get_col(row, 'final_state', cfg).strip().upper()
+
+    if fs in state_map:
+        entry = state_map[fs]
+        return (entry[0], entry[1])
+
+    # Fallback: timing + numeric success field
+    start  = float(get_col(row, 'start',  cfg) or 0)
+    finish = float(get_col(row, 'finish', cfg) or 0)
 
     if start <= 0:
         return ('Waiting', None)
-
     if finish <= 0:
         return ('Running', None)
 
     try:
-        ok = int(float(col(row, 'success') or 0))
+        ok = int(float(get_col(row, 'success', cfg) or 0))
     except ValueError:
         ok = 0
 
     return ('Terminated', 0) if ok == 1 else ('Error', 1)
 
 
-def make_resource(
-    resource_id,
-    proc_id,
-    node_name,
-    cluster,
-    site,
-    core_in_node,
-    cores_per_node
-):
+# ── Resource object builder ───────────────────────────────────────────────────
+
+def make_resource(resource_id, proc_id, node_name, cluster, site,
+                  core_in_node, cores_per_node):
     return {
         "resource_id": resource_id,
         "network_address": node_name,
@@ -201,41 +263,43 @@ def make_resource(
     }
 
 
+# ── Main ──────────────────────────────────────────────────────────────────────
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Convert workload CSV to data.json for goard"
+        description="Convert simulator workload CSV to data.json for goard"
     )
-
-    parser.add_argument("input", help="Input CSV file")
+    parser.add_argument("input",  help="Input CSV file")
     parser.add_argument("output", help="Output JSON file")
-
     parser.add_argument(
-        "--base-time",
-        type=int,
+        "--format",
         default=None,
-        help="Unix timestamp for simulation time 0"
+        help="Format name (e.g. batsim) or path to YAML config. "
+             "Auto-detected if omitted.",
     )
-
     parser.add_argument(
-        "--time-scale",
-        type=float,
-        default=1.0,
-        help="Multiply all simulation times by this factor"
+        "--formats-dir",
+        default=None,
+        help="Directory with format YAML files (default: formats/ next to script)",
     )
-
-    parser.add_argument("--cores-per-node", type=int, default=1)
-    parser.add_argument("--cluster", default="cluster1")
-    parser.add_argument("--site", default="site1")
-    parser.add_argument("--node-prefix", default="node")
-    parser.add_argument("--domain", default=".local")
+    parser.add_argument("--base-time",      type=int,   default=None)
+    parser.add_argument("--time-scale",     type=float, default=1.0)
+    parser.add_argument("--cores-per-node", type=int,   default=1)
+    parser.add_argument("--cluster",        default="cluster1")
+    parser.add_argument("--site",           default="site1")
+    parser.add_argument("--node-prefix",    default="node")
+    parser.add_argument("--domain",         default=".local")
 
     args = parser.parse_args()
 
-    scale = args.time_scale
-
-    if scale <= 0:
+    if args.time_scale <= 0:
         print("ERROR: --time-scale must be > 0", file=sys.stderr)
         sys.exit(1)
+
+    cfg, fmt_name = resolve_config(args)
+    scale = args.time_scale
+
+    print(f"Using format: {fmt_name}", file=sys.stderr)
 
     # ── Auto-detect delimiter ─────────────────────────────────────────────────
     with open(args.input, newline='') as f:
@@ -246,10 +310,8 @@ def main():
 
     # ── Read CSV ──────────────────────────────────────────────────────────────
     rows = []
-
     with open(args.input, newline='') as f:
         reader = csv.DictReader(f, delimiter=delimiter)
-
         for row in reader:
             rows.append({
                 (k.strip() if k else k): (v.strip() if v else '')
@@ -260,171 +322,117 @@ def main():
         print("ERROR: no rows in CSV", file=sys.stderr)
         sys.exit(1)
 
-    print(
-        f"Read {len(rows)} rows, delimiter={repr(delimiter)}",
-        file=sys.stderr
-    )
-
+    print(f"Read {len(rows)} rows, delimiter={repr(delimiter)}", file=sys.stderr)
     print(f"Columns: {list(rows[0].keys())}", file=sys.stderr)
     print(f"time_scale={scale}", file=sys.stderr)
 
     # ── base_time ─────────────────────────────────────────────────────────────
-    max_finish = max(float(col(r, 'finish') or 0) for r in rows)
-    scaled_max_finish = max_finish * scale
+    max_finish = max(float(get_col(r, 'finish', cfg) or 0) for r in rows)
+    scaled_max = max_finish * scale
 
     if args.base_time is None:
-        args.base_time = (
-            int(time.time()) - int(math.ceil(scaled_max_finish))
-        )
-
+        args.base_time = int(time.time()) - int(math.ceil(scaled_max))
         print(
-            f"base_time={args.base_time} "
-            f"(now - {int(math.ceil(scaled_max_finish))}s)",
-            file=sys.stderr
+            f"base_time={args.base_time} (now - {int(math.ceil(scaled_max))}s)",
+            file=sys.stderr,
         )
 
     def to_unix(t):
         v = float(t) if t else 0.0
-
-        if v <= 0:
-            return 0
-
-        return args.base_time + int(v * scale)
+        return 0 if v <= 0 else args.base_time + int(v * scale)
 
     # ── Collect all resource IDs ──────────────────────────────────────────────
     all_procs = set()
-
     for row in rows:
-        all_procs.update(parse_processor_list(col(row, 'resources')))
+        all_procs.update(parse_resources(get_col(row, 'resources', cfg), cfg))
 
     if not all_procs:
         print(
-            "Warning: no allocated_resources/processors found, "
-            "defaulting to proc 0",
-            file=sys.stderr
+            "Warning: no resource IDs found, defaulting to proc 0",
+            file=sys.stderr,
         )
         all_procs = {0}
 
     cpn = args.cores_per_node
-
     resources = []
     proc_to_rid = {}
 
     for proc_id in range(max(all_procs) + 1):
         rid = proc_id + 1
-
         node_id = proc_id // cpn
         core_in_node = proc_id % cpn
-
         node_name = f"{args.node_prefix}{node_id + 1}{args.domain}"
-
         proc_to_rid[proc_id] = rid
-
         resources.append(
-            make_resource(
-                rid,
-                proc_id,
-                node_name,
-                args.cluster,
-                args.site,
-                core_in_node,
-                cpn
-            )
+            make_resource(rid, proc_id, node_name, args.cluster, args.site,
+                          core_in_node, cpn)
         )
 
     # ── Build jobs ────────────────────────────────────────────────────────────
     jobs = {}
-
     for row in rows:
-        job_id = col(row, 'job_id').strip()
-
+        job_id = get_col(row, 'job_id', cfg).strip()
         if not job_id:
             continue
 
-        procs = parse_processor_list(col(row, 'resources'))
-
-        resource_ids = [
-            str(proc_to_rid[p])
-            for p in procs
-            if p in proc_to_rid
-        ]
-
+        procs = parse_resources(get_col(row, 'resources', cfg), cfg)
+        resource_ids = [str(proc_to_rid[p]) for p in procs if p in proc_to_rid]
         node_names = list(dict.fromkeys(
             resources[proc_to_rid[p] - 1]['host']
-            for p in procs
-            if p in proc_to_rid
+            for p in procs if p in proc_to_rid
         ))
 
-        start = float(col(row, 'start') or 0)
-        finish = float(col(row, 'finish') or 0)
-        sub = float(col(row, 'submission') or 0)
+        start    = float(get_col(row, 'start',      cfg) or 0)
+        finish   = float(get_col(row, 'finish',     cfg) or 0)
+        sub      = float(get_col(row, 'submission', cfg) or 0)
+        walltime = int(float(get_col(row, 'walltime', cfg) or 0) * scale)
+        workload = get_col(row, 'workload', cfg) or 'unknown'
 
-        walltime = int(
-            float(col(row, 'walltime') or 0) * scale
-        )
-
-        workload = col(row, 'workload') or 'unknown'
-
-        state, exit_code = infer_state(row)
+        state, exit_code = infer_state(row, cfg)
 
         jobs[job_id] = {
             "owner": workload,
             "state": state,
-
-            # Scaled timestamps
-            "start_time": to_unix(start),
-            "stop_time": to_unix(finish),
-            "submission_time": to_unix(sub),
-            "walltime": walltime,
-
-            # Original simulation timestamps preserved
-            "original_start_time": start,
-            "original_stop_time": finish,
+            "start_time":       to_unix(start),
+            "stop_time":        to_unix(finish),
+            "submission_time":  to_unix(sub),
+            "walltime":         walltime,
+            "original_start_time":      start,
+            "original_stop_time":       finish,
             "original_submission_time": sub,
-            "original_walltime": float(col(row, 'walltime') or 0),
-
-            "time_scale": scale,
-
-            "queue": "default",
-            "resource_id": resource_ids,
-            "network_address": node_names,
-            "job_type": "PASSIVE",
-            "types": ["PASSIVE"],
-            "name": f"job-{job_id}",
-            "project": workload,
-            "command": "",
-            "message": "",
-            "resubmit_job_id": 0,
-
+            "original_walltime":        float(get_col(row, 'walltime', cfg) or 0),
+            "time_scale":       scale,
+            "queue":            "default",
+            "resource_id":      resource_ids,
+            "network_address":  node_names,
+            "job_type":         "PASSIVE",
+            "types":            ["PASSIVE"],
+            "name":             f"job-{job_id}",
+            "project":          workload,
+            "command":          "",
+            "message":          "",
+            "resubmit_job_id":  0,
             "array_id": (
-                int(job_id)
-                if job_id.lstrip('-').isdigit()
-                else 0
+                int(job_id) if job_id.lstrip('-').isdigit() else 0
             ),
-
-            "properties": "",
+            "properties":        "",
             "assigned_hostnames": node_names,
-            "cpuset_name": f"oar_{job_id}",
-            "exit_code": exit_code,
-            "log_name": "",
-            "stderr_file": f"./{job_id}.err",
-            "stdout_file": f"./{job_id}.out",
-            "events": [],
+            "cpuset_name":       f"oar_{job_id}",
+            "exit_code":         exit_code,
+            "log_name":          "",
+            "stderr_file":       f"./{job_id}.err",
+            "stdout_file":       f"./{job_id}.out",
+            "events":            [],
         }
 
-    output = {
-        "resources": resources,
-        "jobs": jobs,
-        "dead_resources": {},
-    }
+    output = {"resources": resources, "jobs": jobs, "dead_resources": {}}
 
     with open(args.output, 'w') as f:
         json.dump(output, f, indent=2)
 
     print(
-        f"Done: {len(resources)} resources, "
-        f"{len(jobs)} jobs → {args.output}",
-        file=sys.stderr
+        f"Done: {len(resources)} resources, {len(jobs)} jobs -> {args.output}",
+        file=sys.stderr,
     )
 
 

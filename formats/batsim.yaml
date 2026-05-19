@@ -1,0 +1,36 @@
+name: batsim
+description: Batsim simulator CSV output
+
+# Columns used to auto-detect this format from CSV headers.
+# Score = number of signature_columns present in the file.
+signature_columns:
+  - final_state
+  - allocated_resources
+  - workload_name
+  - consumed_energy
+
+# Canonical name -> CSV column name (or list tried in order, first match wins)
+columns:
+  job_id:      job_id
+  workload:    workload_name
+  submission:  submission_time
+  walltime:    requested_time
+  success:     success
+  final_state: final_state
+  start:       starting_time
+  finish:      finish_time
+  resources:   allocated_resources
+
+# How the resources field is encoded.
+# "range_or_list": space/comma separated tokens, ranges like 4-7 expanded.
+resource_format: range_or_list
+
+# Maps final_state value (uppercased) -> [goard_state, exit_code]
+# Use null for exit_code when state has no meaningful code.
+state_map:
+  COMPLETED_SUCCESSFULLY: [Terminated, 0]
+  COMPLETED_FAILED:       [Error,      1]
+  FAILED:                 [Error,      1]
+  KILLED:                 [Error,      1]
+
+time_unit: seconds
