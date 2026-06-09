@@ -174,6 +174,18 @@ def infer_state(row, cfg):
     return ('Terminated', 0) if ok == 1 else ('Error', 1)
 
 
+# ── Types inference ───────────────────────────────────────────────────────────
+
+def infer_types(row, cfg):
+    """Return job type string from profile column: evolving, malleable, or rigid."""
+    profile = get_col(row, 'profile', cfg)
+    if 'evolving' in profile:
+        return 'evolving'
+    if 'malleable' in profile:
+        return 'malleable'
+    return 'rigid'
+
+
 # ── Resource object builder ───────────────────────────────────────────────────
 
 def make_resource(resource_id, proc_id, node_name, cluster, site,
@@ -389,6 +401,7 @@ def main():
         workload = get_col(row, 'workload', cfg) or 'unknown'
 
         state, exit_code = infer_state(row, cfg)
+        job_type = infer_types(row, cfg)
 
         jobs[job_id] = {
             "owner": workload,
@@ -405,9 +418,9 @@ def main():
             "queue":            "default",
             "resource_id":      resource_ids,
             "network_address":  node_names,
-            "job_type":         "PASSIVE",
-            "types":            ["PASSIVE"],
-            "name":             f"job-{job_id}",
+            "job_type":         job_type,
+            "types":            job_type,
+            "name":             job_id,
             "project":          workload,
             "command":          "",
             "message":          "",

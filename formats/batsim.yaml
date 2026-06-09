@@ -20,6 +20,7 @@ columns:
   start:       starting_time
   finish:      finish_time
   resources:   allocated_resources
+  profile:     profile
 
 # How the resources field is encoded.
 # "range_or_list": space/comma separated tokens, ranges like 4-7 expanded.
