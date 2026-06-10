@@ -25,6 +25,7 @@ Options:
 """
 
 import argparse
+import re
 import csv
 import json
 import math
@@ -177,13 +178,9 @@ def infer_state(row, cfg):
 # ── Types inference ───────────────────────────────────────────────────────────
 
 def infer_types(row, cfg):
-    """Return job type string from profile column: evolving, malleable, or rigid."""
     profile = get_col(row, 'profile', cfg)
-    if 'evolving' in profile:
-        return 'evolving'
-    if 'malleable' in profile:
-        return 'malleable'
-    return 'rigid'
+    m = re.search(r'(evolving\d*|malleable\d*)', profile)
+    return m.group(1) if m else 'rigid'
 
 
 # ── Resource object builder ───────────────────────────────────────────────────
