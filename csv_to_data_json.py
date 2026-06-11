@@ -150,7 +150,7 @@ def parse_resources(s, cfg):
 # ── State inference ───────────────────────────────────────────────────────────
 
 def infer_state(row, cfg):
-    """Return (goard_state, exit_code) using config state_map + fallback."""
+    """Return (goard_state, exit_code) from final_state via config state_map."""
     state_map = cfg.get("state_map", {})
     fs = get_col(row, 'final_state', cfg).strip().upper()
 
@@ -158,21 +158,7 @@ def infer_state(row, cfg):
         entry = state_map[fs]
         return (entry[0], entry[1])
 
-    # Fallback: timing + numeric success field
-    start  = float(get_col(row, 'start',  cfg) or 0)
-    finish = float(get_col(row, 'finish', cfg) or 0)
-
-    if start <= 0:
-        return ('Waiting', None)
-    if finish <= 0:
-        return ('Running', None)
-
-    try:
-        ok = int(float(get_col(row, 'success', cfg) or 0))
-    except ValueError:
-        ok = 0
-
-    return ('Terminated', 0) if ok == 1 else ('Error', 1)
+    return ('Unknown', None)
 
 
 # ── Types inference ───────────────────────────────────────────────────────────

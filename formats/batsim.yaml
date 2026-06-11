@@ -29,9 +29,10 @@ resource_format: range_or_list
 # Maps final_state value (uppercased) -> [goard_state, exit_code]
 # Use null for exit_code when state has no meaningful code.
 state_map:
-  COMPLETED_SUCCESSFULLY: [Terminated, 0]
-  COMPLETED_FAILED:       [Error,      1]
-  FAILED:                 [Error,      1]
-  KILLED:                 [Error,      1]
+  COMPLETED_SUCCESSFULLY:    [Terminated, 0]
+  COMPLETED_FAILED:          [Error,      1]
+  COMPLETED_WALLTIME_REACHED: [Error,      1]
+  COMPLETED_KILLED:          [Error,      1]
+  REJECTED:                  [ToError,    null]
 
 time_unit: seconds
