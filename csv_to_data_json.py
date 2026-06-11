@@ -250,7 +250,7 @@ def make_resource(resource_id, proc_id, node_name, cluster,
         "switch": "",
         "rconsole": None,
         "grub": None,
-        "production": "YES",
+        "production": None,
         "deploy": "NO",
         "besteffort": "YES",
         "drain": "NO",
@@ -349,7 +349,7 @@ def main():
 
     def to_unix(t):
         v = float(t) if t else 0.0
-        return 0 if v <= 0 else args.base_time + int(v * scale)
+        return args.base_time + int(v * scale)
 
     # ── Collect all resource IDs ──────────────────────────────────────────────
     all_procs = set()
